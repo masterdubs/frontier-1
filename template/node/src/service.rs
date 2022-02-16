@@ -299,6 +299,9 @@ fn remote_keystore(_url: &String) -> Result<Arc<LocalKeystore>, &'static str> {
 
 /// Builds a new service for a full client.
 pub fn new_full(mut config: Configuration, cli: &Cli) -> Result<TaskManager, ServiceError> {
+	// Inject ethereum style rpc id provider
+	config.rpc_id_provider = Some(fc_rpc::EthSubscriptionIdProvider);
+
 	let sc_service::PartialComponents {
 		client,
 		backend,
