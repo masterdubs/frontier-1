@@ -16,7 +16,6 @@ targets = ["x86_64-unknown-linux-gnu"]
 [dependencies]
 structopt = "0.3.8"
 async-trait = "0.1"
-jsonrpc-pubsub = "18.0.0"
 futures = "0.3"
 log = "0.4.8"
 
@@ -42,7 +41,7 @@ sp-timestamp = { git = "https://github.com/purestake/substrate", branch = "jsonr
 sp-inherents = { git = "https://github.com/purestake/substrate", branch = "jsonrpsee-moonbeam-polkadot-v0.9.16" }
 
 # These dependencies are used for the node template's RPCs
-jsonrpc-core = "18.0.0"
+jsonrpsee = { version = "0.8.0", features = ["server", "macros"] }
 sc-rpc = { git = "https://github.com/purestake/substrate", branch = "jsonrpsee-moonbeam-polkadot-v0.9.16" }
 sp-api = { git = "https://github.com/purestake/substrate", branch = "jsonrpsee-moonbeam-polkadot-v0.9.16" }
 sc-rpc-api = { git = "https://github.com/purestake/substrate", branch = "jsonrpsee-moonbeam-polkadot-v0.9.16" }
