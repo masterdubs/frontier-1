@@ -41,7 +41,7 @@ sp-timestamp = { git = "https://github.com/purestake/substrate", branch = "jsonr
 sp-inherents = { git = "https://github.com/purestake/substrate", branch = "jsonrpsee-moonbeam-polkadot-v0.9.16" }
 
 # These dependencies are used for the node template's RPCs
-jsonrpsee = { version = "0.8.0", features = ["server", "macros"] }
+jsonrpsee = { version = "0.9.0", features = ["server", "macros"] }
 sc-rpc = { git = "https://github.com/purestake/substrate", branch = "jsonrpsee-moonbeam-polkadot-v0.9.16" }
 sp-api = { git = "https://github.com/purestake/substrate", branch = "jsonrpsee-moonbeam-polkadot-v0.9.16" }
 sc-rpc-api = { git = "https://github.com/purestake/substrate", branch = "jsonrpsee-moonbeam-polkadot-v0.9.16" }
