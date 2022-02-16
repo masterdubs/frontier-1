@@ -421,3 +421,17 @@ impl EthSigner for EthDevSigner {
 		transaction.ok_or(internal_err("signer not available"))
 	}
 }
+
+/// Generates ethereum compatible subscription ID.
+#[derive(Debug)]
+pub struct EthSubscriptionIdProvider;
+
+impl jsonrpsee::core::traits::IdProvider for EthSubscriptionIdProvider {
+	fn next_id(&self) -> jsonrpsee::types::SubscriptionId<'static> {
+		format!(
+			"0x{}",
+			rand::random::<u128>().to_le_bytes()[..].to_hex::<String>()
+		)
+		.into()
+	}
+}
