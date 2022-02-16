@@ -26,7 +26,7 @@ pub use eth::{
 	EthApi, EthApiServer, EthBlockDataCache, EthFilterApi, EthFilterApiServer, EthTask, NetApi,
 	NetApiServer, Web3Api, Web3ApiServer,
 };
-pub use eth_pubsub::{EthPubSubApi, EthPubSubApiServer, HexEncodedIdProvider};
+pub use eth_pubsub::{EthPubSubApi, EthPubSubApiServer};
 pub use ethereum::TransactionV2 as EthereumTransaction;
 pub use overrides::{
 	OverrideHandle, RuntimeApiStorageOverride, SchemaV1Override, SchemaV2Override,
@@ -36,7 +36,10 @@ pub use overrides::{
 use ethereum_types::{H160, H256};
 use evm::ExitError;
 pub use fc_rpc_core::types::TransactionMessage;
-use jsonrpc_core::{Error, ErrorCode, Value};
+use jsonrpsee::{
+	core::Error,
+	types::error::{CallError, ErrorCode},
+};
 use pallet_evm::ExitReason;
 use rustc_hex::ToHex;
 use sha3::{Digest, Keccak256};
@@ -54,7 +57,7 @@ pub mod frontier_backend_client {
 	use sp_storage::StorageKey;
 
 	use codec::Decode;
-	use jsonrpc_core::Result as RpcResult;
+	use jsonrpsee::core::RpcResult;
 
 	use ethereum_types::H256;
 	use pallet_ethereum::EthereumStorageSchema;
@@ -199,29 +202,31 @@ pub mod frontier_backend_client {
 }
 
 pub fn internal_err<T: ToString>(message: T) -> Error {
-	Error {
-		code: ErrorCode::InternalError,
+	Error::Call(CallError::Custom {
+		code: ErrorCode::InternalError.code(),
 		message: message.to_string(),
 		data: None,
-	}
+	})
 }
 
-pub fn error_on_execution_failure(reason: &ExitReason, data: &[u8]) -> Result<(), Error> {
+pub fn error_on_execution_failure(reason: &ExitReason, data: &[u8]) -> Result<(), CallError> {
 	match reason {
 		ExitReason::Succeed(_) => Ok(()),
 		ExitReason::Error(e) => {
 			if *e == ExitError::OutOfGas {
 				// `ServerError(0)` will be useful in estimate gas
-				return Err(Error {
-					code: ErrorCode::ServerError(0),
+				return Err(CallError::Custom {
+					code: ErrorCode::ServerError(0).code(),
 					message: format!("out of gas"),
 					data: None,
 				});
 			}
-			Err(Error {
-				code: ErrorCode::InternalError,
+			Err(CallError::Custom {
+				code: ErrorCode::InternalError.code(),
 				message: format!("evm error: {:?}", e),
-				data: Some(Value::String("0x".to_string())),
+				data: Some(
+					jsonrpsee::core::to_json_raw_value(&"0x").expect("fail to serialize data"),
+				),
 			})
 		}
 		ExitReason::Revert(_) => {
@@ -237,16 +242,19 @@ pub fn error_on_execution_failure(reason: &ExitReason, data: &[u8]) -> Result<()
 					}
 				}
 			}
-			Err(Error {
-				code: ErrorCode::InternalError,
+			Err(CallError::Custom {
+				code: ErrorCode::InternalError.code(),
 				message,
-				data: Some(Value::String(data.to_hex())),
+				data: Some(
+					jsonrpsee::core::to_json_raw_value::<String>(&data.to_hex())
+						.expect("fail to serialize data"),
+				),
 			})
 		}
-		ExitReason::Fatal(e) => Err(Error {
-			code: ErrorCode::InternalError,
+		ExitReason::Fatal(e) => Err(CallError::Custom {
+			code: ErrorCode::InternalError.code(),
 			message: format!("evm fatal: {:?}", e),
-			data: Some(Value::String("0x".to_string())),
+			data: Some(jsonrpsee::core::to_json_raw_value(&"0x").expect("fail to serialize data")),
 		}),
 	}
 }
