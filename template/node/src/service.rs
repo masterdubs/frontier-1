@@ -370,9 +370,6 @@ pub fn new_full(mut config: Configuration, cli: &Cli) -> Result<TaskManager, Ser
 			warp_sync,
 		})?;
 
-	// Channel for the rpc handler to communicate with the authorship task.
-	let (command_sink, commands_stream) = futures::channel::mpsc::channel(1000);
-
 	if config.offchain_worker.enabled {
 		sc_service::build_offchain_workers(
 			&config,
@@ -395,12 +392,20 @@ pub fn new_full(mut config: Configuration, cli: &Cli) -> Result<TaskManager, Ser
 	let overrides = crate::rpc::overrides_handle(client.clone());
 	let fee_history_limit = cli.run.fee_history_limit;
 
+	#[cfg(not(feature = "manual-seal"))]
+	let command_sink = None;
+	#[cfg(feature = "manual-seal")]
+	let (command_sink, commands_stream) = {
+		let (command_sink, commands_stream) = futures::channel::mpsc::channel(1000);
+		(Some(command_sink), commands_stream)
+	};
+
 	let block_data_cache = Arc::new(fc_rpc::EthBlockDataCache::new(
 		task_manager.spawn_handle(),
 		overrides.clone(),
 		50,
 		50,
-		prometheus_registry.clone(),
+		None,
 	));
 
 	let rpc_extensions_builder = {
@@ -412,6 +417,7 @@ pub fn new_full(mut config: Configuration, cli: &Cli) -> Result<TaskManager, Ser
 		let overrides = overrides.clone();
 		let fee_history_cache = fee_history_cache.clone();
 		let max_past_logs = cli.run.max_past_logs;
+		let block_data_cache = block_data_cache.clone();
 
 		Box::new(move |deny_unsafe, _| {
 			let deps = crate::rpc::FullDeps {
@@ -427,15 +433,12 @@ pub fn new_full(mut config: Configuration, cli: &Cli) -> Result<TaskManager, Ser
 				max_past_logs,
 				fee_history_limit,
 				fee_history_cache: fee_history_cache.clone(),
-				command_sink: Some(command_sink.clone()),
+				command_sink: command_sink.clone(),
 				overrides: overrides.clone(),
 				block_data_cache: block_data_cache.clone(),
 			};
 
-			Ok(crate::rpc::create_full(
-				deps,
-				subscription_task_executor.clone(),
-			))
+			crate::rpc::create_full(deps, subscription_task_executor.clone()).map_err(Into::into)
 		})
 	};
 
@@ -445,7 +448,7 @@ pub fn new_full(mut config: Configuration, cli: &Cli) -> Result<TaskManager, Ser
 		keystore: keystore_container.sync_keystore(),
 		task_manager: &mut task_manager,
 		transaction_pool: transaction_pool.clone(),
-		rpc_extensions_builder,
+		rpc_builder: rpc_extensions_builder,
 		backend: backend.clone(),
 		system_rpc_tx,
 		config,
@@ -535,7 +538,7 @@ pub fn new_full(mut config: Configuration, cli: &Cli) -> Result<TaskManager, Ser
 					// we spawn the future on a background thread managed by service.
 					task_manager.spawn_essential_handle().spawn_blocking(
 						"manual-seal",
-						None,
+						Some("block-authoring"),
 						authorship_future,
 					);
 				}
@@ -561,7 +564,7 @@ pub fn new_full(mut config: Configuration, cli: &Cli) -> Result<TaskManager, Ser
 					// we spawn the future on a background thread managed by service.
 					task_manager.spawn_essential_handle().spawn_blocking(
 						"instant-seal",
-						None,
+						Some("block-authoring"),
 						authorship_future,
 					);
 				}

@@ -27,13 +27,14 @@ use fc_rpc_core::{
 		FilteredParams, Header, Index, Log, PeerCount, Receipt, Rich, RichBlock, SyncInfo,
 		SyncStatus, Transaction, TransactionMessage, TransactionRequest, Work,
 	},
-	EthApi as EthApiT, EthFilterApi as EthFilterApiT, NetApi as NetApiT, Web3Api as Web3ApiT,
+	EthApiServer as EthApiT, EthFilterApiServer as EthFilterApiT, NetApiServer as NetApiT,
+	Web3ApiServer as Web3ApiT,
 };
 pub use fc_rpc_core::{EthApiServer, EthFilterApiServer, NetApiServer, Web3ApiServer};
 use fp_rpc::{ConvertTransactionRuntimeApi, EthereumRuntimeRPCApi, TransactionStatus};
 use fp_storage::EthereumStorageSchema;
 use futures::{future::TryFutureExt, StreamExt};
-use jsonrpc_core::{futures::future, BoxFuture, Result};
+use jsonrpsee::core::{async_trait, RpcResult as Result};
 use lru::LruCache;
 use sc_client_api::{
 	backend::{Backend, StateBackend, StorageProvider},
@@ -499,6 +500,7 @@ fn fee_details(
 	}
 }
 
+#[async_trait]
 impl<B, C, P, CT, BE, H: ExHashT, A, F> EthApiT for EthApi<B, C, P, CT, BE, H, A, F>
 where
 	C: ProvideRuntimeApi<B> + StorageProvider<B, BE>,
@@ -658,159 +660,147 @@ where
 		}
 	}
 
-	fn block_by_hash(&self, hash: H256, full: bool) -> BoxFuture<Result<Option<RichBlock>>> {
+	async fn block_by_hash(&self, hash: H256, full: bool) -> Result<Option<RichBlock>> {
 		let client = Arc::clone(&self.client);
 		let overrides = Arc::clone(&self.overrides);
 		let block_data_cache = Arc::clone(&self.block_data_cache);
 		let backend = Arc::clone(&self.backend);
 
-		Box::pin(async move {
-			let id = match frontier_backend_client::load_hash::<B>(backend.as_ref(), hash)
-				.map_err(|err| internal_err(format!("{:?}", err)))?
-			{
-				Some(hash) => hash,
-				_ => return Ok(None),
-			};
-			let substrate_hash = client
-				.expect_block_hash_from_id(&id)
-				.map_err(|_| internal_err(format!("Expect block number from id: {}", id)))?;
+		let id = match frontier_backend_client::load_hash::<B>(backend.as_ref(), hash)
+			.map_err(|err| internal_err(format!("{:?}", err)))?
+		{
+			Some(hash) => hash,
+			_ => return Ok(None),
+		};
+		let substrate_hash = client
+			.expect_block_hash_from_id(&id)
+			.map_err(|_| internal_err(format!("Expect block number from id: {}", id)))?;
 
-			let schema =
-				frontier_backend_client::onchain_storage_schema::<B, C, BE>(client.as_ref(), id);
-			let handler = overrides
-				.schemas
-				.get(&schema)
-				.unwrap_or(&overrides.fallback);
+		let schema =
+			frontier_backend_client::onchain_storage_schema::<B, C, BE>(client.as_ref(), id);
+		let handler = overrides
+			.schemas
+			.get(&schema)
+			.unwrap_or(&overrides.fallback);
 
-			let block = block_data_cache.current_block(schema, substrate_hash).await;
-			let statuses = block_data_cache
-				.current_transaction_statuses(schema, substrate_hash)
-				.await;
+		let block = block_data_cache.current_block(schema, substrate_hash).await;
+		let statuses = block_data_cache
+			.current_transaction_statuses(schema, substrate_hash)
+			.await;
 
-			let base_fee = handler.base_fee(&id);
-			let is_eip1559 = handler.is_eip1559(&id);
+		let base_fee = handler.base_fee(&id);
+		let is_eip1559 = handler.is_eip1559(&id);
 
-			match (block, statuses) {
-				(Some(block), Some(statuses)) => {
-					let mut rich_block = rich_block_build(
-						block,
-						statuses.into_iter().map(|s| Some(s)).collect(),
-						Some(hash),
-						full,
-						base_fee,
-						is_eip1559,
-					);
-					// Indexers heavily rely on the parent hash.
-					// Moonbase client-level patch for inconsistent runtime 1200 state.
-					let number = rich_block.inner.header.number.unwrap_or_default();
-					if rich_block.inner.header.parent_hash == H256::default()
-						&& number > U256::zero()
-					{
-						let id = BlockId::Hash(substrate_hash);
-						if let Ok(Some(header)) = client.header(id) {
-							let parent_hash = *header.parent_hash();
+		match (block, statuses) {
+			(Some(block), Some(statuses)) => {
+				let mut rich_block = rich_block_build(
+					block,
+					statuses.into_iter().map(|s| Some(s)).collect(),
+					Some(hash),
+					full,
+					base_fee,
+					is_eip1559,
+				);
+				// Indexers heavily rely on the parent hash.
+				// Moonbase client-level patch for inconsistent runtime 1200 state.
+				let number = rich_block.inner.header.number.unwrap_or_default();
+				if rich_block.inner.header.parent_hash == H256::default() && number > U256::zero() {
+					let id = BlockId::Hash(substrate_hash);
+					if let Ok(Some(header)) = client.header(id) {
+						let parent_hash = *header.parent_hash();
 
-							let parent_id = BlockId::Hash(parent_hash);
-							let schema = frontier_backend_client::onchain_storage_schema::<B, C, BE>(
-								client.as_ref(),
-								parent_id,
+						let parent_id = BlockId::Hash(parent_hash);
+						let schema = frontier_backend_client::onchain_storage_schema::<B, C, BE>(
+							client.as_ref(),
+							parent_id,
+						);
+						if let Some(block) =
+							block_data_cache.current_block(schema, parent_hash).await
+						{
+							rich_block.inner.header.parent_hash = H256::from_slice(
+								Keccak256::digest(&rlp::encode(&block.header)).as_slice(),
 							);
-							if let Some(block) =
-								block_data_cache.current_block(schema, parent_hash).await
-							{
-								rich_block.inner.header.parent_hash = H256::from_slice(
-									Keccak256::digest(&rlp::encode(&block.header)).as_slice(),
-								);
-							}
 						}
 					}
-					Ok(Some(rich_block))
 				}
-				_ => Ok(None),
+				Ok(Some(rich_block))
 			}
-		})
+			_ => Ok(None),
+		}
 	}
 
-	fn block_by_number(
-		&self,
-		number: BlockNumber,
-		full: bool,
-	) -> BoxFuture<Result<Option<RichBlock>>> {
+	async fn block_by_number(&self, number: BlockNumber, full: bool) -> Result<Option<RichBlock>> {
 		let client = Arc::clone(&self.client);
 		let overrides = Arc::clone(&self.overrides);
 		let block_data_cache = Arc::clone(&self.block_data_cache);
 		let backend = Arc::clone(&self.backend);
 
-		Box::pin(async move {
-			let id = match frontier_backend_client::native_block_id::<B, C>(
-				client.as_ref(),
-				backend.as_ref(),
-				Some(number),
-			)? {
-				Some(id) => id,
-				None => return Ok(None),
-			};
-			let substrate_hash = client
-				.expect_block_hash_from_id(&id)
-				.map_err(|_| internal_err(format!("Expect block number from id: {}", id)))?;
+		let id = match frontier_backend_client::native_block_id::<B, C>(
+			client.as_ref(),
+			backend.as_ref(),
+			Some(number),
+		)? {
+			Some(id) => id,
+			None => return Ok(None),
+		};
+		let substrate_hash = client
+			.expect_block_hash_from_id(&id)
+			.map_err(|_| internal_err(format!("Expect block number from id: {}", id)))?;
 
-			let schema =
-				frontier_backend_client::onchain_storage_schema::<B, C, BE>(client.as_ref(), id);
-			let handler = overrides
-				.schemas
-				.get(&schema)
-				.unwrap_or(&overrides.fallback);
+		let schema =
+			frontier_backend_client::onchain_storage_schema::<B, C, BE>(client.as_ref(), id);
+		let handler = overrides
+			.schemas
+			.get(&schema)
+			.unwrap_or(&overrides.fallback);
 
-			let block = block_data_cache.current_block(schema, substrate_hash).await;
-			let statuses = block_data_cache
-				.current_transaction_statuses(schema, substrate_hash)
-				.await;
+		let block = block_data_cache.current_block(schema, substrate_hash).await;
+		let statuses = block_data_cache
+			.current_transaction_statuses(schema, substrate_hash)
+			.await;
 
-			let base_fee = handler.base_fee(&id);
-			let is_eip1559 = handler.is_eip1559(&id);
+		let base_fee = handler.base_fee(&id);
+		let is_eip1559 = handler.is_eip1559(&id);
 
-			match (block, statuses) {
-				(Some(block), Some(statuses)) => {
-					let hash =
-						H256::from_slice(Keccak256::digest(&rlp::encode(&block.header)).as_slice());
+		match (block, statuses) {
+			(Some(block), Some(statuses)) => {
+				let hash =
+					H256::from_slice(Keccak256::digest(&rlp::encode(&block.header)).as_slice());
 
-					let mut rich_block = rich_block_build(
-						block,
-						statuses.into_iter().map(|s| Some(s)).collect(),
-						Some(hash),
-						full,
-						base_fee,
-						is_eip1559,
-					);
-					// Indexers heavily rely on the parent hash.
-					// Moonbase client-level patch for inconsistent runtime 1200 state.
-					let number = rich_block.inner.header.number.unwrap_or_default();
-					if rich_block.inner.header.parent_hash == H256::default()
-						&& number > U256::zero()
-					{
-						let id = BlockId::Hash(substrate_hash);
-						if let Ok(Some(header)) = client.header(id) {
-							let parent_hash = *header.parent_hash();
+				let mut rich_block = rich_block_build(
+					block,
+					statuses.into_iter().map(|s| Some(s)).collect(),
+					Some(hash),
+					full,
+					base_fee,
+					is_eip1559,
+				);
+				// Indexers heavily rely on the parent hash.
+				// Moonbase client-level patch for inconsistent runtime 1200 state.
+				let number = rich_block.inner.header.number.unwrap_or_default();
+				if rich_block.inner.header.parent_hash == H256::default() && number > U256::zero() {
+					let id = BlockId::Hash(substrate_hash);
+					if let Ok(Some(header)) = client.header(id) {
+						let parent_hash = *header.parent_hash();
 
-							let parent_id = BlockId::Hash(parent_hash);
-							let schema = frontier_backend_client::onchain_storage_schema::<B, C, BE>(
-								client.as_ref(),
-								parent_id,
+						let parent_id = BlockId::Hash(parent_hash);
+						let schema = frontier_backend_client::onchain_storage_schema::<B, C, BE>(
+							client.as_ref(),
+							parent_id,
+						);
+						if let Some(block) =
+							block_data_cache.current_block(schema, parent_hash).await
+						{
+							rich_block.inner.header.parent_hash = H256::from_slice(
+								Keccak256::digest(&rlp::encode(&block.header)).as_slice(),
 							);
-							if let Some(block) =
-								block_data_cache.current_block(schema, parent_hash).await
-							{
-								rich_block.inner.header.parent_hash = H256::from_slice(
-									Keccak256::digest(&rlp::encode(&block.header)).as_slice(),
-								);
-							}
 						}
 					}
-					Ok(Some(rich_block))
 				}
-				_ => Ok(None),
+				Ok(Some(rich_block))
 			}
-		})
+			_ => Ok(None),
+		}
 	}
 
 	fn transaction_count(&self, address: H160, number: Option<BlockNumber>) -> Result<U256> {
@@ -945,18 +935,18 @@ where
 		}
 	}
 
-	fn send_transaction(&self, request: TransactionRequest) -> BoxFuture<Result<H256>> {
+	async fn send_transaction(&self, request: TransactionRequest) -> Result<H256> {
 		let from = match request.from {
 			Some(from) => from,
 			None => {
 				let accounts = match self.accounts() {
 					Ok(accounts) => accounts,
-					Err(e) => return Box::pin(future::err(e)),
+					Err(e) => return Err(e),
 				};
 
 				match accounts.get(0) {
 					Some(account) => account.clone(),
-					None => return Box::pin(future::err(internal_err("no signer available"))),
+					None => return Err(internal_err("no signer available")),
 				}
 			}
 		};
@@ -965,14 +955,14 @@ where
 			Some(nonce) => nonce,
 			None => match self.transaction_count(from, None) {
 				Ok(nonce) => nonce,
-				Err(e) => return Box::pin(future::err(e)),
+				Err(e) => return Err(e),
 			},
 		};
 
 		let chain_id = match self.chain_id() {
 			Ok(Some(chain_id)) => chain_id.as_u64(),
-			Ok(None) => return Box::pin(future::err(internal_err("chain id not available"))),
-			Err(e) => return Box::pin(future::err(e)),
+			Ok(None) => return Err(internal_err("chain id not available")),
+			Err(e) => return Err(e),
 		};
 
 		let hash = self.client.info().best_hash;
@@ -988,9 +978,9 @@ where
 				if let Ok(Some(block)) = block {
 					block.header.gas_limit
 				} else {
-					return Box::pin(future::err(internal_err(format!(
+					return Err(internal_err(format!(
 						"block unavailable, cannot query gas limit"
-					))));
+					)));
 				}
 			}
 		};
@@ -1025,7 +1015,7 @@ where
 				TransactionMessage::EIP1559(m)
 			}
 			_ => {
-				return Box::pin(future::err(internal_err("invalid transaction parameters")));
+				return Err(internal_err("invalid transaction parameters"));
 			}
 		};
 
@@ -1035,7 +1025,7 @@ where
 			if signer.accounts().contains(&from) {
 				match signer.sign(message, &from) {
 					Ok(t) => transaction = Some(t),
-					Err(e) => return Box::pin(future::err(e)),
+					Err(e) => return Err(e),
 				}
 				break;
 			}
@@ -1043,7 +1033,7 @@ where
 
 		let transaction = match transaction {
 			Some(transaction) => transaction,
-			None => return Box::pin(future::err(internal_err("no signer available"))),
+			None => return Err(internal_err("no signer available")),
 		};
 		let transaction_hash = transaction.hash();
 
@@ -1054,7 +1044,7 @@ where
 			.api_version::<dyn ConvertTransactionRuntimeApi<B>>(&block_hash)
 		{
 			Ok(api_version) => api_version,
-			_ => return Box::pin(future::err(internal_err("cannot access runtime api"))),
+			_ => return Err(internal_err("cannot access runtime api")),
 		};
 
 		let extrinsic = match api_version {
@@ -1064,7 +1054,7 @@ where
 				.convert_transaction(&block_hash, transaction)
 			{
 				Ok(extrinsic) => extrinsic,
-				Err(_) => return Box::pin(future::err(internal_err("cannot access runtime api"))),
+				Err(_) => return Err(internal_err("cannot access runtime api")),
 			},
 			Some(1) => {
 				if let ethereum::TransactionV2::Legacy(legacy_transaction) = transaction {
@@ -1076,51 +1066,44 @@ where
 						.convert_transaction_before_version_2(&block_hash, legacy_transaction)
 					{
 						Ok(extrinsic) => extrinsic,
-						Err(_) => {
-							return Box::pin(future::err(internal_err("cannot access runtime api")))
-						}
+						Err(_) => return Err(internal_err("cannot access runtime api")),
 					}
 				} else {
-					return Box::pin(future::err(internal_err(
-						"This runtime not support eth transactions v2",
-					)));
+					return Err(internal_err("This runtime not support eth transactions v2"));
 				}
 			}
 			None => {
 				if let Some(ref convert_transaction) = self.convert_transaction {
 					convert_transaction.convert_transaction(transaction.clone())
 				} else {
-					return Box::pin(future::err(internal_err(
-						"No TransactionConverter is provided and the runtime api ConvertTransactionRuntimeApi is not found"
-					)));
+					return Err(internal_err("No TransactionConverter is provided and the runtime api ConvertTransactionRuntimeApi is not found"));
 				}
 			}
 			_ => {
-				return Box::pin(future::err(internal_err(
-					"ConvertTransactionRuntimeApi version not supported",
-				)))
+				return Err(internal_err(
+					"The version of ConvertTransactionRuntimeApi is not supported by this client",
+				))
 			}
 		};
 
-		Box::pin(
-			self.pool
-				.submit_one(&block_hash, TransactionSource::Local, extrinsic)
-				.map_ok(move |_| transaction_hash)
-				.map_err(|err| internal_err(F::pool_error(err))),
-		)
+		self.pool
+			.submit_one(&block_hash, TransactionSource::Local, extrinsic)
+			.map_ok(move |_| transaction_hash)
+			.map_err(|err| internal_err(F::pool_error(err)))
+			.await
 	}
 
-	fn send_raw_transaction(&self, bytes: Bytes) -> BoxFuture<Result<H256>> {
+	async fn send_raw_transaction(&self, bytes: Bytes) -> Result<H256> {
 		let slice = &bytes.0[..];
 		if slice.len() == 0 {
-			return Box::pin(future::err(internal_err("transaction data is empty")));
+			return Err(internal_err("transaction data is empty"));
 		}
 		let first = slice.get(0).unwrap();
 		let transaction = if first > &0x7f {
 			// Legacy transaction. Decode and wrap in envelope.
 			match rlp::decode::<ethereum::TransactionV0>(slice) {
 				Ok(transaction) => ethereum::TransactionV2::Legacy(transaction),
-				Err(_) => return Box::pin(future::err(internal_err("decode transaction failed"))),
+				Err(_) => return Err(internal_err("decode transaction failed")),
 			}
 		} else {
 			// Typed Transaction.
@@ -1131,7 +1114,7 @@ where
 			let extend = rlp::encode(&slice);
 			match rlp::decode::<ethereum::TransactionV2>(&extend[..]) {
 				Ok(transaction) => transaction,
-				Err(_) => return Box::pin(future::err(internal_err("decode transaction failed"))),
+				Err(_) => return Err(internal_err("decode transaction failed")),
 			}
 		};
 
@@ -1144,7 +1127,7 @@ where
 			.api_version::<dyn ConvertTransactionRuntimeApi<B>>(&block_hash)
 		{
 			Ok(api_version) => api_version,
-			_ => return Box::pin(future::err(internal_err("cannot access runtime api"))),
+			_ => return Err(internal_err("cannot access runtime api")),
 		};
 
 		let extrinsic = match api_version {
@@ -1154,7 +1137,7 @@ where
 				.convert_transaction(&block_hash, transaction)
 			{
 				Ok(extrinsic) => extrinsic,
-				Err(_) => return Box::pin(future::err(internal_err("cannot access runtime api"))),
+				Err(_) => return Err(internal_err("cannot access runtime api")),
 			},
 			Some(1) => {
 				if let ethereum::TransactionV2::Legacy(legacy_transaction) = transaction {
@@ -1167,37 +1150,32 @@ where
 					{
 						Ok(extrinsic) => extrinsic,
 						Err(_) => {
-							return Box::pin(future::err(internal_err("cannot access runtime api")))
+							return Err(internal_err("cannot access runtime api"));
 						}
 					}
 				} else {
-					return Box::pin(future::err(internal_err(
-						"This runtime not support eth transactions v2",
-					)));
+					return Err(internal_err("This runtime not support eth transactions v2"));
 				}
 			}
 			None => {
 				if let Some(ref convert_transaction) = self.convert_transaction {
 					convert_transaction.convert_transaction(transaction.clone())
 				} else {
-					return Box::pin(future::err(internal_err(
-					"No TransactionConverter is provided and the runtime api ConvertTransactionRuntimeApi is not found"
-				)));
+					return Err(internal_err("No TransactionConverter is provided and the runtime api ConvertTransactionRuntimeApi is not found"));
 				}
 			}
 			_ => {
-				return Box::pin(future::err(internal_err(
-					"ConvertTransactionRuntimeApi version not supported",
-				)))
+				return Err(internal_err(
+					"The version of ConvertTransactionRuntimeApi is not supported by this client",
+				));
 			}
 		};
 
-		Box::pin(
-			self.pool
-				.submit_one(&block_hash, TransactionSource::Local, extrinsic)
-				.map_ok(move |_| transaction_hash)
-				.map_err(|err| internal_err(F::pool_error(err))),
-		)
+		self.pool
+			.submit_one(&block_hash, TransactionSource::Local, extrinsic)
+			.map_ok(move |_| transaction_hash)
+			.map_err(|err| internal_err(F::pool_error(err)))
+			.await
 	}
 
 	fn call(&self, request: CallRequest, number: Option<BlockNumber>) -> Result<Bytes> {
@@ -1433,93 +1411,87 @@ where
 		}
 	}
 
-	fn estimate_gas(
-		&self,
-		request: CallRequest,
-		_: Option<BlockNumber>,
-	) -> BoxFuture<Result<U256>> {
+	async fn estimate_gas(&self, request: CallRequest, _: Option<BlockNumber>) -> Result<U256> {
 		let client = Arc::clone(&self.client);
 		let block_data_cache = Arc::clone(&self.block_data_cache);
 
-		Box::pin(async move {
-			// Define the lower bound of estimate
-			const MIN_GAS_PER_TX: U256 = U256([21_000, 0, 0, 0]);
+		// Define the lower bound of estimate
+		const MIN_GAS_PER_TX: U256 = U256([21_000, 0, 0, 0]);
 
-			// Get best hash (TODO missing support for estimating gas historically)
-			let best_hash = client.info().best_hash;
+		// Get best hash (TODO missing support for estimating gas historically)
+		let best_hash = client.info().best_hash;
 
-			// For simple transfer to simple account, return MIN_GAS_PER_TX directly
-			let is_simple_transfer = match &request.data {
-				None => true,
-				Some(vec) => vec.0.is_empty(),
-			};
-			if is_simple_transfer {
-				if let Some(to) = request.to {
-					let to_code = client
-						.runtime_api()
-						.account_code_at(&BlockId::Hash(best_hash), to)
-						.map_err(|err| internal_err(format!("runtime error: {:?}", err)))?;
-					if to_code.is_empty() {
-						return Ok(MIN_GAS_PER_TX);
-					}
+		// For simple transfer to simple account, return MIN_GAS_PER_TX directly
+		let is_simple_transfer = match &request.data {
+			None => true,
+			Some(vec) => vec.0.is_empty(),
+		};
+		if is_simple_transfer {
+			if let Some(to) = request.to {
+				let to_code = client
+					.runtime_api()
+					.account_code_at(&BlockId::Hash(best_hash), to)
+					.map_err(|err| internal_err(format!("runtime error: {:?}", err)))?;
+				if to_code.is_empty() {
+					return Ok(MIN_GAS_PER_TX);
 				}
 			}
+		}
 
-			let (gas_price, max_fee_per_gas, max_priority_fee_per_gas) = {
-				let details = fee_details(
-					request.gas_price,
-					request.max_fee_per_gas,
-					request.max_priority_fee_per_gas,
-				)?;
-				(
-					details.gas_price,
-					details.max_fee_per_gas,
-					details.max_priority_fee_per_gas,
-				)
-			};
+		let (gas_price, max_fee_per_gas, max_priority_fee_per_gas) = {
+			let details = fee_details(
+				request.gas_price,
+				request.max_fee_per_gas,
+				request.max_priority_fee_per_gas,
+			)?;
+			(
+				details.gas_price,
+				details.max_fee_per_gas,
+				details.max_priority_fee_per_gas,
+			)
+		};
 
-			let get_current_block_gas_limit = || async {
-				let substrate_hash = client.info().best_hash;
-				let id = BlockId::Hash(substrate_hash);
-				let schema =
-					frontier_backend_client::onchain_storage_schema::<B, C, BE>(&client, id);
-				let block = block_data_cache.current_block(schema, substrate_hash).await;
-				if let Some(block) = block {
-					Ok(block.header.gas_limit)
-				} else {
-					return Err(internal_err("block unavailable, cannot query gas limit"));
-				}
-			};
+		let get_current_block_gas_limit = || async {
+			let substrate_hash = client.info().best_hash;
+			let id = BlockId::Hash(substrate_hash);
+			let schema = frontier_backend_client::onchain_storage_schema::<B, C, BE>(&client, id);
+			let block = block_data_cache.current_block(schema, substrate_hash).await;
+			if let Some(block) = block {
+				Ok(block.header.gas_limit)
+			} else {
+				return Err(internal_err("block unavailable, cannot query gas limit"));
+			}
+		};
 
-			// Determine the highest possible gas limits
-			let mut highest = match request.gas {
-				Some(gas) => gas,
-				None => {
-					// query current block's gas limit
-					get_current_block_gas_limit().await?
-				}
-			};
+		// Determine the highest possible gas limits
+		let mut highest = match request.gas {
+			Some(gas) => gas,
+			None => {
+				// query current block's gas limit
+				get_current_block_gas_limit().await?
+			}
+		};
 
-			let api = client.runtime_api();
+		let api = client.runtime_api();
 
-			// Recap the highest gas allowance with account's balance.
-			if let Some(from) = request.from {
-				let gas_price = gas_price.unwrap_or_default();
-				if gas_price > U256::zero() {
-					let balance = api
-						.account_basic(&BlockId::Hash(best_hash), from)
-						.map_err(|err| internal_err(format!("runtime error: {:?}", err)))?
-						.balance;
-					let mut available = balance;
-					if let Some(value) = request.value {
-						if value > available {
-							return Err(internal_err("insufficient funds for transfer"));
-						}
-						available -= value;
+		// Recap the highest gas allowance with account's balance.
+		if let Some(from) = request.from {
+			let gas_price = gas_price.unwrap_or_default();
+			if gas_price > U256::zero() {
+				let balance = api
+					.account_basic(&BlockId::Hash(best_hash), from)
+					.map_err(|err| internal_err(format!("runtime error: {:?}", err)))?
+					.balance;
+				let mut available = balance;
+				if let Some(value) = request.value {
+					if value > available {
+						return Err(internal_err("insufficient funds for transfer"));
 					}
-					let allowance = available / gas_price;
-					if highest > allowance {
-						log::warn!(
+					available -= value;
+				}
+				let allowance = available / gas_price;
+				if highest > allowance {
+					log::warn!(
 						"Gas estimation capped by limited funds original {} balance {} sent {} feecap {} fundable {}",
 						highest,
 						balance,
@@ -1527,20 +1499,20 @@ where
 						gas_price,
 						allowance
 					);
-						highest = allowance;
-					}
+					highest = allowance;
 				}
 			}
+		}
 
-			struct ExecutableResult {
-				data: Vec<u8>,
-				exit_reason: ExitReason,
-				used_gas: U256,
-			}
+		struct ExecutableResult {
+			data: Vec<u8>,
+			exit_reason: ExitReason,
+			used_gas: U256,
+		}
 
-			let client_inner = client.clone();
-			// Create a helper to check if a gas allowance results in an executable transaction
-			#[rustfmt::skip]
+		let client_inner = client.clone();
+		// Create a helper to check if a gas allowance results in an executable transaction
+		#[rustfmt::skip]
 			let executable = move |request, gas_limit, api_version, estimate_mode| -> Result<ExecutableResult> {
 				let CallRequest {
 					from,
@@ -1688,531 +1660,517 @@ where
 					used_gas,
 				})
 			};
-			let api_version = if let Ok(Some(api_version)) =
-				client
-					.runtime_api()
-					.api_version::<dyn EthereumRuntimeRPCApi<B>>(&BlockId::Hash(best_hash))
-			{
-				api_version
-			} else {
+		let api_version = if let Ok(Some(api_version)) =
+			client
+				.runtime_api()
+				.api_version::<dyn EthereumRuntimeRPCApi<B>>(&BlockId::Hash(best_hash))
+		{
+			api_version
+		} else {
+			return Err(internal_err(format!(
+				"failed to retrieve Runtime Api version"
+			)));
+		};
+
+		// Verify that the transaction succeed with highest capacity
+		let cap = highest;
+		let estimate_mode = true;
+		let ExecutableResult {
+			data,
+			exit_reason,
+			used_gas,
+		} = executable(request.clone(), highest, api_version, estimate_mode)?;
+		match exit_reason {
+			ExitReason::Succeed(_) => (),
+			ExitReason::Error(ExitError::OutOfGas) => {
 				return Err(internal_err(format!(
-					"failed to retrieve Runtime Api version"
-				)));
-			};
-
-			// Verify that the transaction succeed with highest capacity
-			let cap = highest;
-			let estimate_mode = true;
-			let ExecutableResult {
-				data,
-				exit_reason,
-				used_gas,
-			} = executable(request.clone(), highest, api_version, estimate_mode)?;
-			match exit_reason {
-				ExitReason::Succeed(_) => (),
-				ExitReason::Error(ExitError::OutOfGas) => {
-					return Err(internal_err(format!(
-						"gas required exceeds allowance {}",
-						cap
-					)))
-				}
-				// If the transaction reverts, there are two possible cases,
-				// it can revert because the called contract feels that it does not have enough
-				// gas left to continue, or it can revert for another reason unrelated to gas.
-				ExitReason::Revert(revert) => {
-					if request.gas.is_some() || request.gas_price.is_some() {
-						// If the user has provided a gas limit or a gas price, then we have executed
-						// with less block gas limit, so we must reexecute with block gas limit to
-						// know if the revert is due to a lack of gas or not.
-						let ExecutableResult {
-							data,
-							exit_reason,
-							used_gas: _,
-						} = executable(
-							request.clone(),
-							get_current_block_gas_limit().await?,
-							api_version,
-							estimate_mode,
-						)?;
-						match exit_reason {
-							ExitReason::Succeed(_) => {
-								return Err(internal_err(format!(
-									"gas required exceeds allowance {}",
-									cap
-								)))
-							}
-							// The execution has been done with block gas limit, so it is not a lack of gas from the user.
-							other => error_on_execution_failure(&other, &data)?,
-						}
-					} else {
-						// The execution has already been done with block gas limit, so it is not a lack of gas from the user.
-						error_on_execution_failure(&ExitReason::Revert(revert), &data)?
-					}
-				}
-				other => error_on_execution_failure(&other, &data)?,
-			};
-
-			#[cfg(not(feature = "rpc_binary_search_estimate"))]
-			{
-				Ok(used_gas)
+					"gas required exceeds allowance {}",
+					cap
+				)))
 			}
-			#[cfg(feature = "rpc_binary_search_estimate")]
-			{
-				// On binary search, evm estimate mode is disabled
-				let estimate_mode = false;
-				// Define the lower bound of the binary search
-				let mut lowest = MIN_GAS_PER_TX;
-
-				// Start close to the used gas for faster binary search
-				let mut mid = std::cmp::min(used_gas * 3, (highest + lowest) / 2);
-
-				// Execute the binary search and hone in on an executable gas limit.
-				let mut previous_highest = highest;
-				while (highest - lowest) > U256::one() {
+			// If the transaction reverts, there are two possible cases,
+			// it can revert because the called contract feels that it does not have enough
+			// gas left to continue, or it can revert for another reason unrelated to gas.
+			ExitReason::Revert(revert) => {
+				if request.gas.is_some() || request.gas_price.is_some() {
+					// If the user has provided a gas limit or a gas price, then we have executed
+					// with less block gas limit, so we must reexecute with block gas limit to
+					// know if the revert is due to a lack of gas or not.
 					let ExecutableResult {
 						data,
 						exit_reason,
 						used_gas: _,
-					} = executable(request.clone(), mid, api_version, estimate_mode)?;
+					} = executable(
+						request.clone(),
+						get_current_block_gas_limit().await?,
+						api_version,
+						estimate_mode,
+					)?;
 					match exit_reason {
 						ExitReason::Succeed(_) => {
-							highest = mid;
-							// If the variation in the estimate is less than 10%,
-							// then the estimate is considered sufficiently accurate.
-							if (previous_highest - highest) * 10 / previous_highest < U256::one() {
-								return Ok(highest);
-							}
-							previous_highest = highest;
+							return Err(internal_err(format!(
+								"gas required exceeds allowance {}",
+								cap
+							)))
 						}
-						ExitReason::Revert(_) | ExitReason::Error(ExitError::OutOfGas) => {
-							lowest = mid;
-						}
+						// The execution has been done with block gas limit, so it is not a lack of gas from the user.
 						other => error_on_execution_failure(&other, &data)?,
 					}
-					mid = (highest + lowest) / 2;
+				} else {
+					// The execution has already been done with block gas limit, so it is not a lack of gas from the user.
+					error_on_execution_failure(&ExitReason::Revert(revert), &data)?
 				}
-
-				Ok(highest)
 			}
-		})
+			other => error_on_execution_failure(&other, &data)?,
+		};
+
+		#[cfg(not(feature = "rpc_binary_search_estimate"))]
+		{
+			Ok(used_gas)
+		}
+		#[cfg(feature = "rpc_binary_search_estimate")]
+		{
+			// On binary search, evm estimate mode is disabled
+			let estimate_mode = false;
+			// Define the lower bound of the binary search
+			let mut lowest = MIN_GAS_PER_TX;
+
+			// Start close to the used gas for faster binary search
+			let mut mid = std::cmp::min(used_gas * 3, (highest + lowest) / 2);
+
+			// Execute the binary search and hone in on an executable gas limit.
+			let mut previous_highest = highest;
+			while (highest - lowest) > U256::one() {
+				let ExecutableResult {
+					data,
+					exit_reason,
+					used_gas: _,
+				} = executable(request.clone(), mid, api_version, estimate_mode)?;
+				match exit_reason {
+					ExitReason::Succeed(_) => {
+						highest = mid;
+						// If the variation in the estimate is less than 10%,
+						// then the estimate is considered sufficiently accurate.
+						if (previous_highest - highest) * 10 / previous_highest < U256::one() {
+							return Ok(highest);
+						}
+						previous_highest = highest;
+					}
+					ExitReason::Revert(_) | ExitReason::Error(ExitError::OutOfGas) => {
+						lowest = mid;
+					}
+					other => error_on_execution_failure(&other, &data)?,
+				}
+				mid = (highest + lowest) / 2;
+			}
+
+			Ok(highest)
+		}
 	}
 
-	fn transaction_by_hash(&self, hash: H256) -> BoxFuture<Result<Option<Transaction>>> {
+	async fn transaction_by_hash(&self, hash: H256) -> Result<Option<Transaction>> {
 		let client = Arc::clone(&self.client);
 		let overrides = Arc::clone(&self.overrides);
 		let block_data_cache = Arc::clone(&self.block_data_cache);
 		let backend = Arc::clone(&self.backend);
 		let graph = Arc::clone(&self.graph);
 
-		Box::pin(async move {
-			let (hash, index) = match frontier_backend_client::load_transactions::<B, C>(
-				client.as_ref(),
-				backend.as_ref(),
-				hash,
-				true,
-			)
-			.map_err(|err| internal_err(format!("{:?}", err)))?
-			{
-				Some((hash, index)) => (hash, index as usize),
-				None => {
-					let api = client.runtime_api();
-					let best_block: BlockId<B> = BlockId::Hash(client.info().best_hash);
+		let (hash, index) = match frontier_backend_client::load_transactions::<B, C>(
+			client.as_ref(),
+			backend.as_ref(),
+			hash,
+			true,
+		)
+		.map_err(|err| internal_err(format!("{:?}", err)))?
+		{
+			Some((hash, index)) => (hash, index as usize),
+			None => {
+				let api = client.runtime_api();
+				let best_block: BlockId<B> = BlockId::Hash(client.info().best_hash);
 
-					let api_version = if let Ok(Some(api_version)) =
-						api.api_version::<dyn EthereumRuntimeRPCApi<B>>(&best_block)
-					{
-						api_version
-					} else {
-						return Err(internal_err(format!(
-							"failed to retrieve Runtime Api version"
-						)));
-					};
-					// If the transaction is not yet mapped in the frontier db,
-					// check for it in the transaction pool.
-					let mut xts: Vec<<B as BlockT>::Extrinsic> = Vec::new();
-					// Collect transactions in the ready validated pool.
-					xts.extend(
-						graph
-							.validated_pool()
-							.ready()
-							.map(|in_pool_tx| in_pool_tx.data().clone())
-							.collect::<Vec<<B as BlockT>::Extrinsic>>(),
-					);
+				let api_version = if let Ok(Some(api_version)) =
+					api.api_version::<dyn EthereumRuntimeRPCApi<B>>(&best_block)
+				{
+					api_version
+				} else {
+					return Err(internal_err(format!(
+						"failed to retrieve Runtime Api version"
+					)));
+				};
+				// If the transaction is not yet mapped in the frontier db,
+				// check for it in the transaction pool.
+				let mut xts: Vec<<B as BlockT>::Extrinsic> = Vec::new();
+				// Collect transactions in the ready validated pool.
+				xts.extend(
+					graph
+						.validated_pool()
+						.ready()
+						.map(|in_pool_tx| in_pool_tx.data().clone())
+						.collect::<Vec<<B as BlockT>::Extrinsic>>(),
+				);
 
-					// Collect transactions in the future validated pool.
-					xts.extend(
-						graph
-							.validated_pool()
-							.futures()
-							.iter()
-							.map(|(_hash, extrinsic)| extrinsic.clone())
-							.collect::<Vec<<B as BlockT>::Extrinsic>>(),
-					);
+				// Collect transactions in the future validated pool.
+				xts.extend(
+					graph
+						.validated_pool()
+						.futures()
+						.iter()
+						.map(|(_hash, extrinsic)| extrinsic.clone())
+						.collect::<Vec<<B as BlockT>::Extrinsic>>(),
+				);
 
-					let ethereum_transactions: Vec<EthereumTransaction> = if api_version > 1 {
-						api.extrinsic_filter(&best_block, xts).map_err(|err| {
+				let ethereum_transactions: Vec<EthereumTransaction> = if api_version > 1 {
+					api.extrinsic_filter(&best_block, xts).map_err(|err| {
+						internal_err(format!("fetch runtime extrinsic filter failed: {:?}", err))
+					})?
+				} else {
+					#[allow(deprecated)]
+					let legacy = api.extrinsic_filter_before_version_2(&best_block, xts)
+						.map_err(|err| {
 							internal_err(format!(
 								"fetch runtime extrinsic filter failed: {:?}",
 								err
 							))
-						})?
-					} else {
-						#[allow(deprecated)]
-						let legacy = api.extrinsic_filter_before_version_2(&best_block, xts)
-							.map_err(|err| {
-								internal_err(format!(
-									"fetch runtime extrinsic filter failed: {:?}",
-									err
-								))
-							})?;
-						legacy.into_iter().map(|tx| tx.into()).collect()
-					};
+						})?;
+					legacy.into_iter().map(|tx| tx.into()).collect()
+				};
 
-					for txn in ethereum_transactions {
-						let inner_hash = txn.hash();
-						if hash == inner_hash {
-							return Ok(Some(transaction_build(txn, None, None, true, None)));
-						}
+				for txn in ethereum_transactions {
+					let inner_hash = txn.hash();
+					if hash == inner_hash {
+						return Ok(Some(transaction_build(txn, None, None, true, None)));
 					}
-					// Unknown transaction.
-					return Ok(None);
 				}
-			};
-
-			let id = match frontier_backend_client::load_hash::<B>(backend.as_ref(), hash)
-				.map_err(|err| internal_err(format!("{:?}", err)))?
-			{
-				Some(hash) => hash,
-				_ => return Ok(None),
-			};
-			let substrate_hash = client
-				.expect_block_hash_from_id(&id)
-				.map_err(|_| internal_err(format!("Expect block number from id: {}", id)))?;
-
-			let schema =
-				frontier_backend_client::onchain_storage_schema::<B, C, BE>(client.as_ref(), id);
-			let handler = overrides
-				.schemas
-				.get(&schema)
-				.unwrap_or(&overrides.fallback);
-
-			let block = block_data_cache.current_block(schema, substrate_hash).await;
-			let statuses = block_data_cache
-				.current_transaction_statuses(schema, substrate_hash)
-				.await;
-
-			let base_fee = handler.base_fee(&id);
-			let is_eip1559 = handler.is_eip1559(&id);
-
-			match (block, statuses) {
-				(Some(block), Some(statuses)) => Ok(Some(transaction_build(
-					block.transactions[index].clone(),
-					Some(block),
-					Some(statuses[index].clone()),
-					is_eip1559,
-					base_fee,
-				))),
-				_ => Ok(None),
+				// Unknown transaction.
+				return Ok(None);
 			}
-		})
+		};
+
+		let id = match frontier_backend_client::load_hash::<B>(backend.as_ref(), hash)
+			.map_err(|err| internal_err(format!("{:?}", err)))?
+		{
+			Some(hash) => hash,
+			_ => return Ok(None),
+		};
+		let substrate_hash = client
+			.expect_block_hash_from_id(&id)
+			.map_err(|_| internal_err(format!("Expect block number from id: {}", id)))?;
+
+		let schema =
+			frontier_backend_client::onchain_storage_schema::<B, C, BE>(client.as_ref(), id);
+		let handler = overrides
+			.schemas
+			.get(&schema)
+			.unwrap_or(&overrides.fallback);
+
+		let block = block_data_cache.current_block(schema, substrate_hash).await;
+		let statuses = block_data_cache
+			.current_transaction_statuses(schema, substrate_hash)
+			.await;
+
+		let base_fee = handler.base_fee(&id);
+		let is_eip1559 = handler.is_eip1559(&id);
+
+		match (block, statuses) {
+			(Some(block), Some(statuses)) => Ok(Some(transaction_build(
+				block.transactions[index].clone(),
+				Some(block),
+				Some(statuses[index].clone()),
+				is_eip1559,
+				base_fee,
+			))),
+			_ => Ok(None),
+		}
 	}
 
-	fn transaction_by_block_hash_and_index(
+	async fn transaction_by_block_hash_and_index(
 		&self,
 		hash: H256,
 		index: Index,
-	) -> BoxFuture<Result<Option<Transaction>>> {
+	) -> Result<Option<Transaction>> {
 		let client = Arc::clone(&self.client);
 		let overrides = Arc::clone(&self.overrides);
 		let block_data_cache = Arc::clone(&self.block_data_cache);
 		let backend = Arc::clone(&self.backend);
 
-		Box::pin(async move {
-			let id = match frontier_backend_client::load_hash::<B>(backend.as_ref(), hash)
-				.map_err(|err| internal_err(format!("{:?}", err)))?
-			{
-				Some(hash) => hash,
-				_ => return Ok(None),
-			};
-			let substrate_hash = client
-				.expect_block_hash_from_id(&id)
-				.map_err(|_| internal_err(format!("Expect block number from id: {}", id)))?;
+		let id = match frontier_backend_client::load_hash::<B>(backend.as_ref(), hash)
+			.map_err(|err| internal_err(format!("{:?}", err)))?
+		{
+			Some(hash) => hash,
+			_ => return Ok(None),
+		};
+		let substrate_hash = client
+			.expect_block_hash_from_id(&id)
+			.map_err(|_| internal_err(format!("Expect block number from id: {}", id)))?;
 
-			let index = index.value();
+		let index = index.value();
 
-			let schema =
-				frontier_backend_client::onchain_storage_schema::<B, C, BE>(client.as_ref(), id);
-			let handler = overrides
-				.schemas
-				.get(&schema)
-				.unwrap_or(&overrides.fallback);
+		let schema =
+			frontier_backend_client::onchain_storage_schema::<B, C, BE>(client.as_ref(), id);
+		let handler = overrides
+			.schemas
+			.get(&schema)
+			.unwrap_or(&overrides.fallback);
 
-			let block = block_data_cache.current_block(schema, substrate_hash).await;
-			let statuses = block_data_cache
-				.current_transaction_statuses(schema, substrate_hash)
-				.await;
+		let block = block_data_cache.current_block(schema, substrate_hash).await;
+		let statuses = block_data_cache
+			.current_transaction_statuses(schema, substrate_hash)
+			.await;
 
-			let base_fee = handler.base_fee(&id);
-			let is_eip1559 = handler.is_eip1559(&id);
+		let base_fee = handler.base_fee(&id);
+		let is_eip1559 = handler.is_eip1559(&id);
 
-			match (block, statuses) {
-				(Some(block), Some(statuses)) => {
-					if let (Some(transaction), Some(status)) =
-						(block.transactions.get(index), statuses.get(index))
-					{
-						return Ok(Some(transaction_build(
-							transaction.clone(),
-							Some(block),
-							Some(status.clone()),
-							is_eip1559,
-							base_fee,
-						)));
-					} else {
-						return Err(internal_err(format!("{:?} is out of bounds", index)));
-					}
+		match (block, statuses) {
+			(Some(block), Some(statuses)) => {
+				if let (Some(transaction), Some(status)) =
+					(block.transactions.get(index), statuses.get(index))
+				{
+					return Ok(Some(transaction_build(
+						transaction.clone(),
+						Some(block),
+						Some(status.clone()),
+						is_eip1559,
+						base_fee,
+					)));
+				} else {
+					return Err(internal_err(format!("{:?} is out of bounds", index)));
 				}
-				_ => Ok(None),
 			}
-		})
+			_ => Ok(None),
+		}
 	}
 
-	fn transaction_by_block_number_and_index(
+	async fn transaction_by_block_number_and_index(
 		&self,
 		number: BlockNumber,
 		index: Index,
-	) -> BoxFuture<Result<Option<Transaction>>> {
+	) -> Result<Option<Transaction>> {
 		let client = Arc::clone(&self.client);
 		let overrides = Arc::clone(&self.overrides);
 		let block_data_cache = Arc::clone(&self.block_data_cache);
 		let backend = Arc::clone(&self.backend);
 
-		Box::pin(async move {
-			let id = match frontier_backend_client::native_block_id::<B, C>(
-				client.as_ref(),
-				backend.as_ref(),
-				Some(number),
-			)? {
-				Some(id) => id,
-				None => return Ok(None),
-			};
-			let substrate_hash = client
-				.expect_block_hash_from_id(&id)
-				.map_err(|_| internal_err(format!("Expect block number from id: {}", id)))?;
+		let id = match frontier_backend_client::native_block_id::<B, C>(
+			client.as_ref(),
+			backend.as_ref(),
+			Some(number),
+		)? {
+			Some(id) => id,
+			None => return Ok(None),
+		};
+		let substrate_hash = client
+			.expect_block_hash_from_id(&id)
+			.map_err(|_| internal_err(format!("Expect block number from id: {}", id)))?;
 
-			let index = index.value();
-			let schema =
-				frontier_backend_client::onchain_storage_schema::<B, C, BE>(client.as_ref(), id);
-			let handler = overrides
-				.schemas
-				.get(&schema)
-				.unwrap_or(&overrides.fallback);
+		let index = index.value();
+		let schema =
+			frontier_backend_client::onchain_storage_schema::<B, C, BE>(client.as_ref(), id);
+		let handler = overrides
+			.schemas
+			.get(&schema)
+			.unwrap_or(&overrides.fallback);
 
-			let block = block_data_cache.current_block(schema, substrate_hash).await;
-			let statuses = block_data_cache
-				.current_transaction_statuses(schema, substrate_hash)
-				.await;
+		let block = block_data_cache.current_block(schema, substrate_hash).await;
+		let statuses = block_data_cache
+			.current_transaction_statuses(schema, substrate_hash)
+			.await;
 
-			let base_fee = handler.base_fee(&id);
-			let is_eip1559 = handler.is_eip1559(&id);
+		let base_fee = handler.base_fee(&id);
+		let is_eip1559 = handler.is_eip1559(&id);
 
-			match (block, statuses) {
-				(Some(block), Some(statuses)) => {
-					if let (Some(transaction), Some(status)) =
-						(block.transactions.get(index), statuses.get(index))
-					{
-						return Ok(Some(transaction_build(
-							transaction.clone(),
-							Some(block),
-							Some(status.clone()),
-							is_eip1559,
-							base_fee,
-						)));
-					} else {
-						return Err(internal_err(format!("{:?} is out of bounds", index)));
-					}
+		match (block, statuses) {
+			(Some(block), Some(statuses)) => {
+				if let (Some(transaction), Some(status)) =
+					(block.transactions.get(index), statuses.get(index))
+				{
+					return Ok(Some(transaction_build(
+						transaction.clone(),
+						Some(block),
+						Some(status.clone()),
+						is_eip1559,
+						base_fee,
+					)));
+				} else {
+					return Err(internal_err(format!("{:?} is out of bounds", index)));
 				}
-				_ => Ok(None),
 			}
-		})
+			_ => Ok(None),
+		}
 	}
 
-	fn transaction_receipt(&self, hash: H256) -> BoxFuture<Result<Option<Receipt>>> {
+	async fn transaction_receipt(&self, hash: H256) -> Result<Option<Receipt>> {
 		let client = Arc::clone(&self.client);
 		let overrides = Arc::clone(&self.overrides);
 		let block_data_cache = Arc::clone(&self.block_data_cache);
 		let backend = Arc::clone(&self.backend);
 
-		Box::pin(async move {
-			let (hash, index) = match frontier_backend_client::load_transactions::<B, C>(
-				client.as_ref(),
-				backend.as_ref(),
-				hash,
-				true,
-			)
+		let (hash, index) = match frontier_backend_client::load_transactions::<B, C>(
+			client.as_ref(),
+			backend.as_ref(),
+			hash,
+			true,
+		)
+		.map_err(|err| internal_err(format!("{:?}", err)))?
+		{
+			Some((hash, index)) => (hash, index as usize),
+			None => return Ok(None),
+		};
+
+		let id = match frontier_backend_client::load_hash::<B>(backend.as_ref(), hash)
 			.map_err(|err| internal_err(format!("{:?}", err)))?
-			{
-				Some((hash, index)) => (hash, index as usize),
-				None => return Ok(None),
-			};
+		{
+			Some(hash) => hash,
+			_ => return Ok(None),
+		};
+		let substrate_hash = client
+			.expect_block_hash_from_id(&id)
+			.map_err(|_| internal_err(format!("Expect block number from id: {}", id)))?;
 
-			let id = match frontier_backend_client::load_hash::<B>(backend.as_ref(), hash)
-				.map_err(|err| internal_err(format!("{:?}", err)))?
-			{
-				Some(hash) => hash,
-				_ => return Ok(None),
-			};
-			let substrate_hash = client
-				.expect_block_hash_from_id(&id)
-				.map_err(|_| internal_err(format!("Expect block number from id: {}", id)))?;
+		let schema =
+			frontier_backend_client::onchain_storage_schema::<B, C, BE>(client.as_ref(), id);
+		let handler = overrides
+			.schemas
+			.get(&schema)
+			.unwrap_or(&overrides.fallback);
 
-			let schema =
-				frontier_backend_client::onchain_storage_schema::<B, C, BE>(client.as_ref(), id);
-			let handler = overrides
-				.schemas
-				.get(&schema)
-				.unwrap_or(&overrides.fallback);
+		let block = block_data_cache.current_block(schema, substrate_hash).await;
+		let statuses = block_data_cache
+			.current_transaction_statuses(schema, substrate_hash)
+			.await;
+		let receipts = handler.current_receipts(&id);
+		let is_eip1559 = handler.is_eip1559(&id);
 
-			let block = block_data_cache.current_block(schema, substrate_hash).await;
-			let statuses = block_data_cache
-				.current_transaction_statuses(schema, substrate_hash)
-				.await;
-			let receipts = handler.current_receipts(&id);
-			let is_eip1559 = handler.is_eip1559(&id);
+		match (block, statuses, receipts) {
+			(Some(block), Some(statuses), Some(receipts)) => {
+				let block_hash =
+					H256::from_slice(Keccak256::digest(&rlp::encode(&block.header)).as_slice());
+				let receipt = receipts[index].clone();
 
-			match (block, statuses, receipts) {
-				(Some(block), Some(statuses), Some(receipts)) => {
-					let block_hash =
-						H256::from_slice(Keccak256::digest(&rlp::encode(&block.header)).as_slice());
-					let receipt = receipts[index].clone();
-
-					let (logs, logs_bloom, status_code, cumulative_gas_used, gas_used) =
-						if !is_eip1559 {
-							// Pre-london frontier update stored receipts require cumulative gas calculation.
-							match receipt {
-								ethereum::ReceiptV3::Legacy(d) => {
-									let index = core::cmp::min(receipts.len(), index + 1);
-									let cumulative_gas: u32 = receipts[..index]
-										.iter()
-										.map(|r| match r {
-											ethereum::ReceiptV3::Legacy(d) => {
-												Ok(d.used_gas.as_u32())
-											}
-											_ => Err(internal_err(format!(
-												"Unknown receipt for request {}",
-												hash
-											))),
-										})
-										.sum::<Result<u32>>()?;
-									(
-										d.logs,
-										d.logs_bloom,
-										d.status_code,
-										U256::from(cumulative_gas),
-										d.used_gas,
-									)
-								}
-								_ => {
-									return Err(internal_err(format!(
+				let (logs, logs_bloom, status_code, cumulative_gas_used, gas_used) = if !is_eip1559
+				{
+					// Pre-london frontier update stored receipts require cumulative gas calculation.
+					match receipt {
+						ethereum::ReceiptV3::Legacy(d) => {
+							let index = core::cmp::min(receipts.len(), index + 1);
+							let cumulative_gas: u32 = receipts[..index]
+								.iter()
+								.map(|r| match r {
+									ethereum::ReceiptV3::Legacy(d) => Ok(d.used_gas.as_u32()),
+									_ => Err(internal_err(format!(
 										"Unknown receipt for request {}",
 										hash
-									)))
-								}
-							}
-						} else {
-							match receipt {
-								ethereum::ReceiptV3::Legacy(d)
-								| ethereum::ReceiptV3::EIP2930(d)
-								| ethereum::ReceiptV3::EIP1559(d) => {
-									let cumulative_gas = d.used_gas;
-									let gas_used = if index > 0 {
-										let previous_receipt = receipts[index - 1].clone();
-										let previous_gas_used = match previous_receipt {
-											ethereum::ReceiptV3::Legacy(d)
-											| ethereum::ReceiptV3::EIP2930(d)
-											| ethereum::ReceiptV3::EIP1559(d) => d.used_gas,
-										};
-										cumulative_gas.saturating_sub(previous_gas_used)
-									} else {
-										cumulative_gas
-									};
-									(
-										d.logs,
-										d.logs_bloom,
-										d.status_code,
-										cumulative_gas,
-										gas_used,
-									)
-								}
-							}
-						};
-
-					let status = statuses[index].clone();
-					let mut cumulative_receipts = receipts.clone();
-					cumulative_receipts.truncate((status.transaction_index + 1) as usize);
-
-					let transaction = block.transactions[index].clone();
-					let effective_gas_price = match transaction {
-						EthereumTransaction::Legacy(t) => t.gas_price,
-						EthereumTransaction::EIP2930(t) => t.gas_price,
-						EthereumTransaction::EIP1559(t) => handler
-							.base_fee(&id)
-							.unwrap_or_default()
-							.checked_add(t.max_priority_fee_per_gas)
-							.unwrap_or(U256::max_value()),
-					};
-
-					return Ok(Some(Receipt {
-						transaction_hash: Some(status.transaction_hash),
-						transaction_index: Some(status.transaction_index.into()),
-						block_hash: Some(block_hash),
-						from: Some(status.from),
-						to: status.to,
-						block_number: Some(block.header.number),
-						cumulative_gas_used,
-						gas_used: Some(gas_used),
-						contract_address: status.contract_address,
-						logs: {
-							let mut pre_receipts_log_index = None;
-							if cumulative_receipts.len() > 0 {
-								cumulative_receipts.truncate(cumulative_receipts.len() - 1);
-								pre_receipts_log_index = Some(
-									cumulative_receipts
-										.iter()
-										.map(|r| match r {
-											ethereum::ReceiptV3::Legacy(d)
-											| ethereum::ReceiptV3::EIP2930(d)
-											| ethereum::ReceiptV3::EIP1559(d) => d.logs.len() as u32,
-										})
-										.sum::<u32>(),
-								);
-							}
-							logs.iter()
-								.enumerate()
-								.map(|(i, log)| Log {
-									address: log.address,
-									topics: log.topics.clone(),
-									data: Bytes(log.data.clone()),
-									block_hash: Some(block_hash),
-									block_number: Some(block.header.number),
-									transaction_hash: Some(status.transaction_hash),
-									transaction_index: Some(status.transaction_index.into()),
-									log_index: Some(U256::from(
-										(pre_receipts_log_index.unwrap_or(0)) + i as u32,
-									)),
-									transaction_log_index: Some(U256::from(i)),
-									removed: false,
+									))),
 								})
-								.collect()
-						},
-						status_code: Some(U64::from(status_code)),
-						logs_bloom: logs_bloom,
-						state_root: None,
-						effective_gas_price,
-					}));
-				}
-				_ => Ok(None),
+								.sum::<Result<u32>>()?;
+							(
+								d.logs,
+								d.logs_bloom,
+								d.status_code,
+								U256::from(cumulative_gas),
+								d.used_gas,
+							)
+						}
+						_ => {
+							return Err(internal_err(format!(
+								"Unknown receipt for request {}",
+								hash
+							)))
+						}
+					}
+				} else {
+					match receipt {
+						ethereum::ReceiptV3::Legacy(d)
+						| ethereum::ReceiptV3::EIP2930(d)
+						| ethereum::ReceiptV3::EIP1559(d) => {
+							let cumulative_gas = d.used_gas;
+							let gas_used = if index > 0 {
+								let previous_receipt = receipts[index - 1].clone();
+								let previous_gas_used = match previous_receipt {
+									ethereum::ReceiptV3::Legacy(d)
+									| ethereum::ReceiptV3::EIP2930(d)
+									| ethereum::ReceiptV3::EIP1559(d) => d.used_gas,
+								};
+								cumulative_gas.saturating_sub(previous_gas_used)
+							} else {
+								cumulative_gas
+							};
+							(
+								d.logs,
+								d.logs_bloom,
+								d.status_code,
+								cumulative_gas,
+								gas_used,
+							)
+						}
+					}
+				};
+
+				let status = statuses[index].clone();
+				let mut cumulative_receipts = receipts.clone();
+				cumulative_receipts.truncate((status.transaction_index + 1) as usize);
+
+				let transaction = block.transactions[index].clone();
+				let effective_gas_price = match transaction {
+					EthereumTransaction::Legacy(t) => t.gas_price,
+					EthereumTransaction::EIP2930(t) => t.gas_price,
+					EthereumTransaction::EIP1559(t) => handler
+						.base_fee(&id)
+						.unwrap_or_default()
+						.checked_add(t.max_priority_fee_per_gas)
+						.unwrap_or(U256::max_value()),
+				};
+
+				return Ok(Some(Receipt {
+					transaction_hash: Some(status.transaction_hash),
+					transaction_index: Some(status.transaction_index.into()),
+					block_hash: Some(block_hash),
+					from: Some(status.from),
+					to: status.to,
+					block_number: Some(block.header.number),
+					cumulative_gas_used,
+					gas_used: Some(gas_used),
+					contract_address: status.contract_address,
+					logs: {
+						let mut pre_receipts_log_index = None;
+						if cumulative_receipts.len() > 0 {
+							cumulative_receipts.truncate(cumulative_receipts.len() - 1);
+							pre_receipts_log_index = Some(
+								cumulative_receipts
+									.iter()
+									.map(|r| match r {
+										ethereum::ReceiptV3::Legacy(d)
+										| ethereum::ReceiptV3::EIP2930(d)
+										| ethereum::ReceiptV3::EIP1559(d) => d.logs.len() as u32,
+									})
+									.sum::<u32>(),
+							);
+						}
+						logs.iter()
+							.enumerate()
+							.map(|(i, log)| Log {
+								address: log.address,
+								topics: log.topics.clone(),
+								data: Bytes(log.data.clone()),
+								block_hash: Some(block_hash),
+								block_number: Some(block.header.number),
+								transaction_hash: Some(status.transaction_hash),
+								transaction_index: Some(status.transaction_index.into()),
+								log_index: Some(U256::from(
+									(pre_receipts_log_index.unwrap_or(0)) + i as u32,
+								)),
+								transaction_log_index: Some(U256::from(i)),
+								removed: false,
+							})
+							.collect()
+					},
+					status_code: Some(U64::from(status_code)),
+					logs_bloom: logs_bloom,
+					state_root: None,
+					effective_gas_price,
+				}));
 			}
-		})
+			_ => Ok(None),
+		}
 	}
 
 	fn uncle_by_block_hash_and_index(&self, _: H256, _: Index) -> Result<Option<RichBlock>> {
@@ -2227,71 +2185,67 @@ where
 		Ok(None)
 	}
 
-	fn logs(&self, filter: Filter) -> BoxFuture<Result<Vec<Log>>> {
+	async fn logs(&self, filter: Filter) -> Result<Vec<Log>> {
 		let client = Arc::clone(&self.client);
 		let block_data_cache = Arc::clone(&self.block_data_cache);
 		let backend = Arc::clone(&self.backend);
 		let max_past_logs = self.max_past_logs;
 
-		Box::pin(async move {
-			let mut ret: Vec<Log> = Vec::new();
-			if let Some(hash) = filter.block_hash.clone() {
-				let id = match frontier_backend_client::load_hash::<B>(backend.as_ref(), hash)
-					.map_err(|err| internal_err(format!("{:?}", err)))?
-				{
-					Some(hash) => hash,
-					_ => return Ok(Vec::new()),
-				};
-				let substrate_hash = client
-					.expect_block_hash_from_id(&id)
-					.map_err(|_| internal_err(format!("Expect block number from id: {}", id)))?;
+		let mut ret: Vec<Log> = Vec::new();
+		if let Some(hash) = filter.block_hash.clone() {
+			let id = match frontier_backend_client::load_hash::<B>(backend.as_ref(), hash)
+				.map_err(|err| internal_err(format!("{:?}", err)))?
+			{
+				Some(hash) => hash,
+				_ => return Ok(Vec::new()),
+			};
+			let substrate_hash = client
+				.expect_block_hash_from_id(&id)
+				.map_err(|_| internal_err(format!("Expect block number from id: {}", id)))?;
 
-				let schema = frontier_backend_client::onchain_storage_schema::<B, C, BE>(
-					client.as_ref(),
-					id,
-				);
+			let schema =
+				frontier_backend_client::onchain_storage_schema::<B, C, BE>(client.as_ref(), id);
 
-				let block = block_data_cache.current_block(schema, substrate_hash).await;
-				let statuses = block_data_cache
-					.current_transaction_statuses(schema, substrate_hash)
-					.await;
-				if let (Some(block), Some(statuses)) = (block, statuses) {
-					filter_block_logs(&mut ret, &filter, block, statuses);
-				}
-			} else {
-				let best_number = client.info().best_number;
-				let mut current_number = filter
-					.to_block
-					.clone()
-					.and_then(|v| v.to_min_block_num())
-					.map(|s| s.unique_saturated_into())
-					.unwrap_or(best_number);
-
-				if current_number > best_number {
-					current_number = best_number;
-				}
-
-				let from_number = filter
-					.from_block
-					.clone()
-					.and_then(|v| v.to_min_block_num())
-					.map(|s| s.unique_saturated_into())
-					.unwrap_or(client.info().best_number);
-
-				let _ = filter_range_logs(
-					client.as_ref(),
-					backend.as_ref(),
-					&block_data_cache,
-					&mut ret,
-					max_past_logs,
-					&filter,
-					from_number,
-					current_number,
-				)
-				.await?;
+			let block = block_data_cache.current_block(schema, substrate_hash).await;
+			let statuses = block_data_cache
+				.current_transaction_statuses(schema, substrate_hash)
+				.await;
+			if let (Some(block), Some(statuses)) = (block, statuses) {
+				filter_block_logs(&mut ret, &filter, block, statuses);
 			}
-			Ok(ret)
-		})
+		} else {
+			let best_number = client.info().best_number;
+			let mut current_number = filter
+				.to_block
+				.clone()
+				.and_then(|v| v.to_min_block_num())
+				.map(|s| s.unique_saturated_into())
+				.unwrap_or(best_number);
+
+			if current_number > best_number {
+				current_number = best_number;
+			}
+
+			let from_number = filter
+				.from_block
+				.clone()
+				.and_then(|v| v.to_min_block_num())
+				.map(|s| s.unique_saturated_into())
+				.unwrap_or(client.info().best_number);
+
+			let _ = filter_range_logs(
+				client.as_ref(),
+				backend.as_ref(),
+				&block_data_cache,
+				&mut ret,
+				max_past_logs,
+				&filter,
+				from_number,
+				current_number,
+			)
+			.await?;
+		}
+		Ok(ret)
 	}
 
 	fn work(&self) -> Result<Work> {
@@ -2628,6 +2582,7 @@ where
 	}
 }
 
+#[async_trait]
 impl<B, C, BE> EthFilterApiT for EthFilterApi<B, C, BE>
 where
 	C: ProvideRuntimeApi<B> + StorageProvider<B, BE>,
@@ -2650,7 +2605,7 @@ where
 		Err(internal_err("Method not available."))
 	}
 
-	fn filter_changes(&self, index: Index) -> BoxFuture<Result<FilterChanges>> {
+	async fn filter_changes(&self, index: Index) -> Result<FilterChanges> {
 		// There are multiple branches that needs to return async blocks.
 		// Also, each branch need to (synchronously) do stuff with the pool
 		// (behind a lock), and the lock should be released before entering
@@ -2669,7 +2624,7 @@ where
 				from_number: NumberFor<B>,
 				current_number: NumberFor<B>,
 			},
-			Error(jsonrpc_core::Error),
+			Error(jsonrpsee::core::Error),
 		}
 
 		let key = U256::from(index.value());
@@ -2760,55 +2715,52 @@ where
 		let backend = Arc::clone(&self.backend);
 		let max_past_logs = self.max_past_logs;
 
-		Box::pin(async move {
-			match path {
-				FuturePath::Error(err) => Err(err),
-				FuturePath::Block { last, next } => {
-					let mut ethereum_hashes: Vec<H256> = Vec::new();
-					for n in last..next {
-						let id = BlockId::Number(n.unique_saturated_into());
-						let substrate_hash =
-							client.expect_block_hash_from_id(&id).map_err(|_| {
-								internal_err(format!("Expect block number from id: {}", id))
-							})?;
+		match path {
+			FuturePath::Error(err) => Err(err),
+			FuturePath::Block { last, next } => {
+				let mut ethereum_hashes: Vec<H256> = Vec::new();
+				for n in last..next {
+					let id = BlockId::Number(n.unique_saturated_into());
+					let substrate_hash = client.expect_block_hash_from_id(&id).map_err(|_| {
+						internal_err(format!("Expect block number from id: {}", id))
+					})?;
 
-						let schema = frontier_backend_client::onchain_storage_schema::<B, C, BE>(
-							client.as_ref(),
-							id,
-						);
+					let schema = frontier_backend_client::onchain_storage_schema::<B, C, BE>(
+						client.as_ref(),
+						id,
+					);
 
-						let block = block_data_cache.current_block(schema, substrate_hash).await;
-						if let Some(block) = block {
-							ethereum_hashes.push(block.header.hash())
-						}
+					let block = block_data_cache.current_block(schema, substrate_hash).await;
+					if let Some(block) = block {
+						ethereum_hashes.push(block.header.hash())
 					}
-					Ok(FilterChanges::Hashes(ethereum_hashes))
 				}
-				FuturePath::Log {
-					filter,
+				Ok(FilterChanges::Hashes(ethereum_hashes))
+			}
+			FuturePath::Log {
+				filter,
+				from_number,
+				current_number,
+			} => {
+				let mut ret: Vec<Log> = Vec::new();
+				let _ = filter_range_logs(
+					client.as_ref(),
+					backend.as_ref(),
+					&block_data_cache,
+					&mut ret,
+					max_past_logs,
+					&filter,
 					from_number,
 					current_number,
-				} => {
-					let mut ret: Vec<Log> = Vec::new();
-					let _ = filter_range_logs(
-						client.as_ref(),
-						backend.as_ref(),
-						&block_data_cache,
-						&mut ret,
-						max_past_logs,
-						&filter,
-						from_number,
-						current_number,
-					)
-					.await?;
+				)
+				.await?;
 
-					Ok(FilterChanges::Logs(ret))
-				}
+				Ok(FilterChanges::Logs(ret))
 			}
-		})
+		}
 	}
 
-	fn filter_logs(&self, index: Index) -> BoxFuture<Result<Vec<Log>>> {
+	async fn filter_logs(&self, index: Index) -> Result<Vec<Log>> {
 		let key = U256::from(index.value());
 		let pool = self.filter_pool.clone();
 
@@ -2837,46 +2789,44 @@ where
 		let backend = Arc::clone(&self.backend);
 		let max_past_logs = self.max_past_logs;
 
-		Box::pin(async move {
-			let filter = filter_result?;
+		let filter = filter_result?;
 
-			let best_number = client.info().best_number;
-			let mut current_number = filter
-				.to_block
-				.clone()
-				.and_then(|v| v.to_min_block_num())
-				.map(|s| s.unique_saturated_into())
-				.unwrap_or(best_number);
+		let best_number = client.info().best_number;
+		let mut current_number = filter
+			.to_block
+			.clone()
+			.and_then(|v| v.to_min_block_num())
+			.map(|s| s.unique_saturated_into())
+			.unwrap_or(best_number);
 
-			if current_number > best_number {
-				current_number = best_number;
-			}
+		if current_number > best_number {
+			current_number = best_number;
+		}
 
-			if current_number > client.info().best_number {
-				current_number = client.info().best_number;
-			}
+		if current_number > client.info().best_number {
+			current_number = client.info().best_number;
+		}
 
-			let from_number = filter
-				.from_block
-				.clone()
-				.and_then(|v| v.to_min_block_num())
-				.map(|s| s.unique_saturated_into())
-				.unwrap_or(client.info().best_number);
+		let from_number = filter
+			.from_block
+			.clone()
+			.and_then(|v| v.to_min_block_num())
+			.map(|s| s.unique_saturated_into())
+			.unwrap_or(client.info().best_number);
 
-			let mut ret: Vec<Log> = Vec::new();
-			let _ = filter_range_logs(
-				client.as_ref(),
-				backend.as_ref(),
-				&block_data_cache,
-				&mut ret,
-				max_past_logs,
-				&filter,
-				from_number,
-				current_number,
-			)
-			.await?;
-			Ok(ret)
-		})
+		let mut ret: Vec<Log> = Vec::new();
+		let _ = filter_range_logs(
+			client.as_ref(),
+			backend.as_ref(),
+			&block_data_cache,
+			&mut ret,
+			max_past_logs,
+			&filter,
+			from_number,
+			current_number,
+		)
+		.await?;
+		Ok(ret)
 	}
 
 	fn uninstall_filter(&self, index: Index) -> Result<bool> {
